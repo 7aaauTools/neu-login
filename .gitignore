@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# 凭据 (切勿提交)
+.neu_credentials.json
+credentials.json
+
+# 采集日志
+connection_log_*.txt

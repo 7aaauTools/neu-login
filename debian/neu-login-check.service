@@ -1,0 +1,12 @@
+[Unit]
+Description=NEU campus network login check (oneshot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/neu_login.py
+# 脚本自带完整自愈: 不在线则登录, 幽灵会话则注销重建, 在线则退出
+# 最坏路径(双探测+AC检测+CAS往返+轮询确认+幽灵注销重建)可逼近90s, 留足余量
+TimeoutStartSec=180

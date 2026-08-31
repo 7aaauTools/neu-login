@@ -1,0 +1,63 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 7aaau
+# NetworkManager dispatcher: WiFi 连上 NEU 网络后立即登录 (秒级响应)
+# 与 neu-login-check.timer 配合: 事件驱动保证响应速度, 定时巡检提供可靠性保障
+# 安装位置: /etc/NetworkManager/dispatcher.d/90-neu-login (root:root, 755)
+# 日志: journalctl -t neu-login
+#
+# 注意: connectivity-change/hostname 事件 NM 传入的网卡参数恒为 "none"
+#       (官方文档明确的行为), 因此先按 ACTION 分发; 网卡参数为 none 时
+#       从 nmcli 反查当前活动的无线连接, 不能直接按 wlan* 过滤
+
+IFACE="$1"
+ACTION="$2"
+LOGIN="/usr/bin/python3 /usr/local/bin/neu_login.py"
+
+case "$ACTION" in
+    up|connectivity-change) ;;
+    *) exit 0 ;;
+esac
+
+if [ "$IFACE" = "none" ]; then
+    # connectivity-change 事件: 反查当前活动的无线连接 (NM 未给具体网卡)
+    act=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null |
+          grep ':802-11-wireless$' | head -1)
+    [ -n "$act" ] || exit 0
+    CONN=$(echo "$act" | cut -d: -f1)
+    IFACE=$(echo "$act" | cut -d: -f2)
+else
+    case "$IFACE" in
+        wlan*|wl*) ;;
+        *) exit 0 ;;
+    esac
+    CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":$IFACE" | cut -d: -f1)
+fi
+
+# 确认活动连接是 NEU 网络
+case "$CONN" in
+    *NEU*) ;;
+    *) exit 0 ;;
+esac
+
+# 等待 IP/DNS 就绪
+sleep 3
+
+logger -t neu-login "$ACTION $IFACE ($CONN), 触发校园网登录"
+
+# 最多尝试3次 (认证门户的启动可能晚于 DHCP 完成)
+i=1
+while [ "$i" -le 3 ]; do
+    out=$($LOGIN 2>&1)
+    rc=$?
+    [ -n "$out" ] && echo "$out" | logger -t neu-login
+    if [ "$rc" -eq 0 ]; then
+        logger -t neu-login "登录成功 (第${i}次尝试)"
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 8
+done
+
+logger -t neu-login "3次尝试均失败, 等待下一轮定时巡检"
+exit 1

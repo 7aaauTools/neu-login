@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic NEU login health check (no resident process)
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

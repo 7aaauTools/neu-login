@@ -1,0 +1,11 @@
+# Linux 部署脚本与源码强制 LF, 避免从 Windows 检出后拷贝到 Linux 无法执行
+*.sh text eol=lf
+*.py text eol=lf
+90-neu-login text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.md text eol=lf
+*.gitignore text eol=lf
+# Windows 专用脚本保持 CRLF
+*.ps1 text eol=crlf
+LICENSE text eol=lf
