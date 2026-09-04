@@ -42,6 +42,10 @@ read -r PWD_
 python3 "$DEST" -u "$UNAME" -p "$PWD_" --save
 
 # 4. 连接WiFi(开放网络) 并自动连接
+# 注意: 不要显式设置 wifi-sec.key-mgmt none —— NetworkManager 会将 [wifi-security]
+#       段解释为 WEP 并索要密钥, 导致激活失败 "Secrets were required, but not provided"
+#       (实测 NM 1.52.1 / Debian 13); 纯开放网络的正确表示是 profile 中不存在该段。
+#       因此先删除同名旧 profile 再重建: 旧版脚本写入的 key-mgmt none 无法通过 modify 修复
 if command -v nmcli >/dev/null 2>&1; then
     echo ""
     printf "--- 要现在配置并连接 NEU-2.4G 吗? [Y/n] "
@@ -51,8 +55,9 @@ if command -v nmcli >/dev/null 2>&1; then
         *)
             WLAN_IF=$(nmcli -t -f DEVICE,TYPE device status | grep ':wifi' | head -n1 | cut -d: -f1)
             if [ -n "$WLAN_IF" ]; then
+                nmcli connection delete NEU-2.4G 2>/dev/null || true
                 nmcli connection add type wifi ifname "$WLAN_IF" con-name NEU-2.4G ssid NEU-2.4G 2>/dev/null || true
-                nmcli connection modify NEU-2.4G wifi-sec.key-mgmt none connection.autoconnect yes connection.autoconnect-priority 10
+                nmcli connection modify NEU-2.4G connection.autoconnect yes connection.autoconnect-priority 10
                 nmcli connection up NEU-2.4G || echo "[!] 连接失败, 稍后可手动: nmcli connection up NEU-2.4G"
             else
                 echo "[!] 未发现无线网卡 (检查: nmcli device; 内核日志: dmesg)"
