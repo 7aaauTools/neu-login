@@ -6,7 +6,8 @@
 # 适用: 任何具备无线/有线网络接口、使用 systemd + NetworkManager 的
 #       Linux 主机 (Debian / Ubuntu / Raspberry Pi OS 等)
 # 依赖: python3 + NetworkManager (主流发行版默认安装)
-# 用法: sudo sh setup.sh
+# 用法: sudo sh setup.sh [--ssid NEU]   (默认连接 2.4GHz 的 NEU-2.4G)
+#       指定 5GHz: sudo sh setup.sh --ssid NEU
 # ============================================================
 set -e
 
@@ -17,7 +18,25 @@ DEST="/usr/local/bin/neu_login.py"
 [ -f "$SRC" ] || SRC="$SCRIPT_DIR/neu_login.py"
 [ -f "$SRC" ] || { echo "[!] 找不到 neu_login.py"; exit 1; }
 
-echo "=== NEU 校园网自动登录部署 ==="
+# SSID: 默认 NEU-2.4G (2.4GHz 开放网络); 可用 --ssid NEU 指定 5GHz,
+# 或环境变量 NEU_SSID=NEU。连接名(con-name)与 SSID 保持一致, 且需保留 "NEU"
+# 字样 —— 事件驱动脚本 90-neu-login 按连接名匹配 *NEU* 决定是否触发登录。
+SSID="${NEU_SSID:-NEU-2.4G}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ssid)
+            if [ -z "$2" ]; then echo "[!] --ssid 需要指定 SSID, 例: --ssid NEU"; exit 1; fi
+            SSID="$2"; shift 2 ;;
+        --ssid=*) SSID="${1#--ssid=}"; shift ;;
+        *) shift ;;
+    esac
+done
+case "$SSID" in
+    *NEU*) ;;
+    *) echo "[!] 警告: SSID '$SSID' 不含 'NEU', 事件驱动登录(按连接名匹配 *NEU*)将不触发" ;;
+esac
+
+echo "=== NEU 校园网自动登录部署 (SSID: $SSID) ==="
 
 # 1. 安装脚本
 install -m 755 "$SRC" "$DEST"
@@ -48,17 +67,21 @@ python3 "$DEST" -u "$UNAME" -p "$PWD_" --save
 #       因此先删除同名旧 profile 再重建: 旧版脚本写入的 key-mgmt none 无法通过 modify 修复
 if command -v nmcli >/dev/null 2>&1; then
     echo ""
-    printf "--- 要现在配置并连接 NEU-2.4G 吗? [Y/n] "
+    printf -- "--- 要现在配置并连接 %s 吗? [Y/n] " "$SSID"
     read -r ANS
     case "$ANS" in
         n|N) ;;
         *)
             WLAN_IF=$(nmcli -t -f DEVICE,TYPE device status | grep ':wifi' | head -n1 | cut -d: -f1)
             if [ -n "$WLAN_IF" ]; then
+                # 清理本项目历史 profile 名 (含旧版脚本写入者), 避免同优先级的多余
+                # profile 与新建的连接抢关联
+                nmcli connection delete "$SSID" 2>/dev/null || true
                 nmcli connection delete NEU-2.4G 2>/dev/null || true
-                nmcli connection add type wifi ifname "$WLAN_IF" con-name NEU-2.4G ssid NEU-2.4G 2>/dev/null || true
-                nmcli connection modify NEU-2.4G connection.autoconnect yes connection.autoconnect-priority 10
-                nmcli connection up NEU-2.4G || echo "[!] 连接失败, 稍后可手动: nmcli connection up NEU-2.4G"
+                nmcli connection delete NEU 2>/dev/null || true
+                nmcli connection add type wifi ifname "$WLAN_IF" con-name "$SSID" ssid "$SSID" 2>/dev/null || true
+                nmcli connection modify "$SSID" connection.autoconnect yes connection.autoconnect-priority 10
+                nmcli connection up "$SSID" || echo "[!] 连接失败, 稍后可手动: nmcli connection up $SSID"
             else
                 echo "[!] 未发现无线网卡 (检查: nmcli device; 内核日志: dmesg)"
             fi
