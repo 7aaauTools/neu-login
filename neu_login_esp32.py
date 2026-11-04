@@ -578,6 +578,7 @@ class HTTPClient:
     def request(self, url, method="GET", body=None, headers=None, timeout=12,
                 max_body=_MAX_BODY):
         proto, _, rest = url.partition("://")
+        proto = proto.lower()      # 必须归一化: 否则 "HTTPS://" 会被当明文 80 端口
         hp, _, path = rest.partition("/")
         path = "/" + path
         if ":" in hp:
@@ -818,7 +819,7 @@ def _url_authority(u):
     i = u.find("://")
     if i <= 0:
         raise ValueError("missing-scheme")
-    scheme = u[:i].lower()
+    scheme = u[:i]          # 保持原样: 白名单要求严格小写, 避免大小写绕过
     rest = u[i + 3:]
     end = len(rest)
     for ch in ("/", "?", "#"):

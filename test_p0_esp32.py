@@ -414,6 +414,7 @@ def test_cas_redirect_whitelist_rejects_attack_urls():
         "https://pass.neu.edu.cn:8443/tpass/login?service=x",              # 非标准端口
         "https://pass.neu.edu.cn:abc/tpass/login?service=x",               # 非法端口
         "https://pass.neu.edu.cn./tpass/login?service=x",                  # 尾点
+        "HTTPS://pass.neu.edu.cn/tpass/login?service=x",                   # 大写 scheme 绕过尝试
         "", None,
     ]
     for url in bad:
@@ -497,6 +498,25 @@ def test_refresh_disabled_even_if_tls_verified_when_insecure():
     # P3-4: ALLOW_INSECURE_TLS=True 且 _TLS_VERIFIED=True 的组合也必须拒绝刷新
     with _patched(m, ALLOW_INSECURE_TLS=True, _TLS_VERIFIED=True, _KEY_CACHE=None):
         _raises(lambda: m.get_key(client=object(), refresh=True), RuntimeError)
+
+
+def test_httpclient_normalizes_uppercase_scheme():
+    # 防御纵深: 即使白名单被绕过, "HTTPS://" 也必须按 443+TLS 处理, 不能明文 80
+    calls = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_open(host, port, use_ssl, timeout=12):
+        calls.append((host, port, use_ssl))
+        raise _Stop()
+
+    with _patched(m, _open=fake_open):
+        try:
+            m.HTTPClient().request("HTTPS://pass.neu.edu.cn/tpass/login")
+        except _Stop:
+            pass
+    _eq(calls[0], ("pass.neu.edu.cn", 443, True), "大写 HTTPS 也应走 443 + TLS")
 
 
 def main():

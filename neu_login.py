@@ -564,6 +564,7 @@ def _auth_state_paths():
 
     非 root 只用 -u/-p 且未 --save 时 ~/.config/neu 可能不存在,
     此时必须能回退, 否则防锁号守卫静默失效(fail-open)。
+    回退路径按 uid 区分, 避免同机其他用户预置同名文件造成冷却 DoS。
     """
     if _AUTH_FAIL_FILE:
         return [_AUTH_FAIL_FILE]
@@ -571,7 +572,8 @@ def _auth_state_paths():
     d = os.path.dirname(CRED_FILE)
     if d:
         paths.append(os.path.join(d, ".authfail"))
-    paths.append(os.path.join(tempfile.gettempdir(), "neu-login.authfail"))
+    uid = getattr(os, "getuid", lambda: "user")()
+    paths.append(os.path.join(tempfile.gettempdir(), "neu-login-%s.authfail" % uid))
     return paths
 
 
@@ -580,14 +582,22 @@ def _auth_state_file():
     return paths[0]
 
 
+def _write_auth_state(path):
+    """以 0600 + O_NOFOLLOW 写入时间戳(防符号链接截断/越权写)"""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, str(int(time.time())).encode())
+    finally:
+        os.close(fd)
+
+
 def mark_auth_failure():
     """记录一次"认证被拒", 供后续进程/巡检快速跳过, 避免把账号试到锁定"""
     global _AUTH_FAIL_FILE
-    payload = str(int(time.time()))
     for path in _auth_state_paths():
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(payload)
+            _write_auth_state(path)
             _AUTH_FAIL_FILE = path      # 记住可写位置, 同进程后续读写一致
             return
         except OSError:
@@ -608,7 +618,7 @@ def recent_auth_failure():
     for path in _auth_state_paths():
         try:
             with open(path, encoding="utf-8") as f:
-                ts = int(f.read().strip())
+                ts = int(f.read(64).strip())     # 限制读取长度, 防超大文件 DoS
         except (OSError, ValueError):
             continue
         if 0 <= now - ts < AUTH_FAIL_GUARD_SEC:
