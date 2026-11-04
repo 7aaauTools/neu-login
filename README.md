@@ -11,6 +11,8 @@
 - **幽灵会话检测与自愈**：认证记录存在但流量被门户劫持（实际无法上网）时，自动注销并重建会话
 - **AC 编号（ac_id）动态检测**：从劫持 URL 自动识别本网段真实编号，跨网段（不同宿舍楼/教学馆）移动免配置
 - **公钥轮换自愈**：CAS 登录公钥变化时自动在线刷新并重试，无需升级脚本
+- **安全默认值**：TLS 证书强制校验（证书错误不再静默降级）；SSO 跳转强制白名单校验；认证被拒不重试、不锁号
+- **可诊断退出码**：`0`=成功/在线，`2`=网络/证书暂时性失败（可重试），`3`=凭据/账号/设备数/配置错误（重试无意义）；`--test` 自检失败返回 `1`，便于 systemd 与脚本判断
 - **多设备管理**：列出账号所有在线设备、踢指定设备下线（应对账号 3 台设备上限）
 - **附带工具**：Windows 连接过程采集脚本、离线单元测试
 
@@ -21,6 +23,7 @@
 | `neu_login.py` | 主脚本：登录 / 状态 / 注销 / 守护 / 多设备管理（CPython 3.6+，Windows/Linux 通用） |
 | `neu_login_esp32.py` | ESP32 MicroPython 版：可独立运行，或作为库集成至业务代码 |
 | `test_neu_login.py` | 离线单元测试（不联网、不需要凭据） |
+| `test_p0_cpython.py` / `test_p0_esp32.py` | P0 安全/健壮性回归测试（离线，覆盖网络异常收敛、认证失败分级退避、SSO 白名单、TLS 证书校验与公钥刷新门禁） |
 | `capture_connection.ps1` | Windows 连接过程日志采集脚本（用于连接过程分析与排障） |
 | `debian/` | Linux 主机一键部署（Debian 及兼容发行版；PC / 服务器 / 树莓派 / 开发板 / 随身 WiFi 设备），见 [`debian/部署指南.md`](debian/部署指南.md) |
 
@@ -33,7 +36,7 @@ python neu_login.py -u 你的学号 -p 你的密码 --save
 # 之后登录只需
 python neu_login.py
 
-# 断线自动重连守护（Ctrl+C 退出）
+# 断线自动重连守护（Ctrl+C 退出；网络类失败指数退避，认证被拒会自动停止以免锁号）
 python neu_login.py --watch
 
 # 在线状态与流量 / 注销 / 链路自检
@@ -45,8 +48,10 @@ python neu_login.py --test
 python neu_login.py --devices
 python neu_login.py --kick 172.26.x.x
 
-# 离线单元测试
+# 离线单元测试 / P0 回归测试（均不联网、不需要凭据）
 python test_neu_login.py
+python test_p0_cpython.py
+python test_p0_esp32.py
 ```
 
 ## ESP32 版
@@ -57,6 +62,9 @@ python test_neu_login.py
 2. 上传到 ESP32 并命名为 `main.py`（mpremote / Thonny / ampy 均可）
 3. 上电自动连 WiFi 并登录；板载 LED 亮 = 在线，灭 = 掉线
 4. 同一文件也可直接在 PC 上调试：`python neu_login_esp32.py check`
+
+> **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**（需 NTP 或 `mpremote rtc --set`），时间错误会报证书校验失败。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
+> `openssl s_client -showcerts -connect pass.neu.edu.cn:443` 更新 `CA_CERT_PEM`。
 
 **方式 B：作为库集成到自己的业务代码**
 
@@ -115,12 +123,16 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 - 凭据以**明文**保存（每次登录需用原始密码做 RSA 加密，无法加密存储）：Windows = 脚本同目录 `.neu_credentials.json`；Linux root = `/etc/neu/credentials.json`；Linux 普通用户 = `~/.config/neu/credentials.json`
 - Linux 下凭据文件权限为 600，仅文件属主可读（Windows 无此权限模型，共用电脑请注意）
+- **TLS**：两版默认都校验证书（CPython 用系统 CA，ESP32 用内置 CA + `server_hostname` 主机名校验）；证书错误**不再自动降级**（旧行为可被中间人利用），请先校准系统时间（NTP）；仅确认网络可信时才用 `--insecure` 显式关闭校验（CPython 下会同时禁用公钥在线刷新）
+- **SSO 跳转白名单**：两版都会校验：门户走明文 HTTP，CAS 跳转必须为 `https://pass.neu.edu.cn`、ticket 回跳必须为 `ipgw.neu.edu.cn`，防止同网段中间人把登录引导到攻击者服务器
+- **防锁号**：凭据被拒时返回退出码 `3`，`--watch` 立即停止并在 30 分钟内不再尝试 CAS（状态文件与凭据同目录；`--kick` 成功或 `--save` 新凭据会立即解除冷却）；网络/证书类失败按 15s→900s 指数退避，且 10 分钟内最多 3 次登录尝试。设备数超限（E2620）同样以 `3` 退出但**不写冷却**，`--kick` 释放名额后可直接重试
+- **凭据目录不可写时**：认证失败冷却会回退到系统临时目录，避免守卫静默失效
 - 本机开启代理（如 Clash）不影响使用：脚本一律直连校园网服务器、不经过系统代理，在线探测结果也不会被代理干扰
 - 凭据文件已列入 `.gitignore`，请勿提交到仓库或分享给他人
 
 ## 其他说明
 
-- **公钥同步**：RSA 公钥（`PUBKEY_B64`）在 `neu_login.py` 与 `neu_login_esp32.py` 中各内置一份（运行环境不同无法共用）；学校轮换密钥时脚本会自动在线刷新，若需更新内置默认公钥请两处同步修改
+- **公钥同步**：RSA 公钥（`PUBKEY_B64`）在 `neu_login.py` 与 `neu_login_esp32.py` 中各内置一份（运行环境不同无法共用）；学校轮换密钥时脚本会**在 TLS 校验生效的前提下**自动在线刷新（CPython `--insecure` 或 ESP32 `ALLOW_INSECURE_TLS=True` 时禁用刷新，需手动更新内置公钥），更新内置默认公钥请两处同步修改
 - **适用范围**：针对东北大学（南湖校区）校园网（深澜门户 + CAS 统一身份认证）实现与验证；其他校区或学校若认证系统相同可自行尝试，不作保证
 
 ## 免责声明
@@ -133,6 +145,12 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
+- **v1.1** 安全与健壮性修复（P0）：
+  - CPython：网络异常统一收敛，`--watch` 不再被一次网络抖动杀死；认证失败分级（auth/transient/config/limit）+ 指数退避 + 防锁号守卫 + 登录限流；SSO 跳转与 ticket 回跳强制白名单；证书错误不再自动降级，`--insecure` 显式关闭并禁用公钥刷新
+  - ESP32：默认强制 TLS 证书链与主机名校验（内置 GlobalSign CA，`server_hostname` 校验主机名），校验失败不降级；`ALLOW_INSECURE_TLS=True` 时禁用公钥在线刷新；同步实现 SSO 跳转白名单；`ensure_online()` 永不抛异常
+  - 新增 `test_p0_cpython.py` / `test_p0_esp32.py` 离线回归测试
+  - 部署：dispatcher 按退出码重试（凭据/账号/设备数错误不重试）、修复 connectivity-change 事件不触发的问题；service 固定 UTF-8 输出
+  - 文档：明确 TLS 校验/设备对时要求，删除"证书错误自动降级"的旧说明
 - **v1.0** 首个发布版本
 
 ## 许可证
