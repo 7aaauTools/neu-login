@@ -26,15 +26,20 @@
     python neu_login.py --kick 172.26.x.x  # 踢指定IP设备下线
 
 用法:
-    python neu_login.py -u 学号 -p 密码           # 登录 (学号=统一身份认证账号)
-    python neu_login.py -u 学号 -p 密码 --save    # 登录并保存凭据
+    python neu_login.py -u 学号                   # 登录 (交互输入密码, 不落命令历史)
+    python neu_login.py -u 学号 --save            # 登录并保存凭据(交互输入密码)
     python neu_login.py                           # 用已保存凭据登录
     python neu_login.py --status                  # 查看在线状态/流量
     python neu_login.py --logout                  # 注销下线
     python neu_login.py --test                    # 链路+RSA自检(无需凭据)
     python neu_login.py --watch                   # 断线自动重连守护
-    python neu_login.py --devices                 # 列出账号在线设备
+    python neu_login.py --devices                 # 列出账号在线设备(需凭据)
     python neu_login.py --kick IP                 # 踢指定设备下线
+    echo '密码' | python neu_login.py -u 学号 --password-stdin   # 非交互场景
+
+密码入口(PR1):
+    -u 指定学号后, 终端下会 getpass 隐藏输入; 管道/CI 用 --password-stdin;
+    -p/--password 仍兼容, 但会告警(密码会进入命令历史/进程列表), 请改用上述方式。
 
 退出码:
     0 = 成功/已在线
@@ -53,6 +58,7 @@ TLS:
 
 import argparse
 import base64
+import getpass
 import hashlib
 import http.client
 import http.cookiejar
@@ -763,18 +769,39 @@ def wait_portal(timeout=300):
 def list_devices(username, password):
     """列出账号所有在线设备: /v1/srun_portal_online
 
-    超过设备数上限时登录被拒(E2620), 需先踢掉闲置设备
+    安全性说明 (PR1/A2): 该接口按门户设计需要提交 md5(密码)。
+    本函数优先尝试 HTTPS(若门户支持), 失败才回退明文 HTTP 并显式告警——
+    明文 HTTP 下同网段可嗅探到无盐 md5, 弱口令可离线爆破。
+    超过设备数上限时登录被拒(E2620), 需先踢掉闲置设备。
     """
     params = urllib.parse.urlencode({
         "user_name": username,
         "password": hashlib.md5(password.encode()).hexdigest(),
     })
-    opener, _ = make_opener()
-    _, body, _ = fetch(opener, f"{PORTAL}/v1/srun_portal_online?{params}")
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        return {"error": f"响应异常: {body[:120]}"}
+    last_err = None
+    plain_http_used = False
+    for base in ("https://" + PORTAL_HOST, PORTAL):
+        try:
+            opener, _ = make_opener()
+            _, body, _ = fetch(opener, "%s/v1/srun_portal_online?%s" % (base, params))
+        except PortalError as ex:
+            last_err = ex
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            last_err = "响应异常: %s" % body[:80]
+            continue
+        if base.startswith("http://"):
+            plain_http_used = True
+        if plain_http_used:
+            print("[!] 警告: 无法通过 HTTPS 访问门户设备接口, 已回退明文 HTTP; "
+                  "本次以明文发送 md5(密码), 同网段可嗅探/离线爆破; "
+                  "建议改用网页端设备管理", file=sys.stderr)
+        return data
+    print("[!] 警告: 无法通过 HTTPS 访问门户设备接口, 已尝试明文 HTTP 仍失败; "
+          "不要在不信任的网络下重试 --devices", file=sys.stderr)
+    return {"error": "获取设备列表失败: %s" % (last_err or "门户无响应")}
 
 
 def kick_device(username, password, ip):
@@ -877,20 +904,66 @@ def fix_service_url(redirect):
 # ============ 凭据管理 ============
 
 def save_credentials(username, password):
+    """原子保存凭据 (PR1/A3)
+
+    - 目录 0700 (POSIX), 文件以 0600 创建;
+    - 先写同目录 0600 临时文件再 os.replace, 消除"先写后 chmod"的权限窗口;
+    - Windows 无 POSIX 权限模型, 如实提示(不再谎称"权限600")。
+    """
     d = os.path.dirname(CRED_FILE)
     if d:
-        os.makedirs(d, exist_ok=True)
-    with open(CRED_FILE, "w", encoding="utf-8") as f:
-        json.dump({"username": username, "password": password}, f)
-    os.chmod(CRED_FILE, 0o600)
-    print(f"[i] 凭据已保存到 {CRED_FILE} (权限600, 明文, 注意安全)")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        if os.name == "posix":
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+    fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=".neu-cred-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"username": username, "password": password}, f)
+        os.replace(tmp, CRED_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    if os.name == "posix":
+        try:
+            os.chmod(CRED_FILE, 0o600)      # 兜底: 目标已存在时也收紧
+        except OSError:
+            pass
+        note = "(POSIX 权限 600)"
+    else:
+        note = "(Windows 无 POSIX 文件权限模型, 仅受 ACL 保护; 请勿放在共享/云同步目录)"
+    print(f"[i] 凭据已保存到 {CRED_FILE} {note}, 明文, 注意安全")
 
 
 def load_credentials():
-    if os.path.exists(CRED_FILE):
+    """读取凭据; 文件缺失/损坏/字段不全时返回 None 并给出可操作提示"""
+    try:
         with open(CRED_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return None
+            data = json.load(f)
+    except OSError:
+        return None
+    except ValueError:                       # JSONDecodeError 是 ValueError 子类
+        print(f"[!] 凭据文件损坏(JSON 解析失败), 请重新执行 --save: {CRED_FILE}",
+              file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or not data.get("username") or not data.get("password"):
+        print(f"[!] 凭据文件缺少 username/password, 请重新执行 --save: {CRED_FILE}",
+              file=sys.stderr)
+        return None
+    if os.name == "posix":
+        try:
+            mode = os.stat(CRED_FILE).st_mode & 0o777
+            if mode & 0o077:
+                print(f"[!] 警告: 凭据文件权限过宽 ({oct(mode)}), "
+                      f"建议 chmod 600: {CRED_FILE}", file=sys.stderr)
+        except OSError:
+            pass
+    return data
 
 
 # ============ 自检 ============
@@ -989,7 +1062,8 @@ def _dispatch(args, ap):
         else:
             cred = load_credentials()
             if not cred:
-                ap.error("请提供 -u 学号 -p 密码, 或先用 --save 保存凭据")
+                ap.error("请先用 --save 保存凭据, 或提供 -u 学号 并交互输入密码"
+                         "(脚本场景用 --password-stdin)")
         if args.devices:
             r = list_devices(cred["username"], cred["password"])
             devs = r.get("data") or []
@@ -1019,7 +1093,8 @@ def _dispatch(args, ap):
     else:
         cred = load_credentials()
         if not cred:
-            ap.error("请提供 -u 学号 -p 密码, 或先用 --save 保存凭据")
+            ap.error("请先用 --save 保存凭据, 或提供 -u 学号 并交互输入密码"
+                     "(脚本场景用 --password-stdin)")
 
     if args.watch:
         return watch_loop(cred)
@@ -1033,7 +1108,11 @@ def _dispatch(args, ap):
 def main():
     ap = argparse.ArgumentParser(description="东北大学校园网自动登录 (CAS统一身份认证/RSA)")
     ap.add_argument("-u", "--username", help="统一身份认证学号")
-    ap.add_argument("-p", "--password", help="统一身份认证密码")
+    ap.add_argument("-p", "--password",
+                    help="统一身份认证密码(不推荐: 会进入命令历史/进程列表; "
+                         "建议省略后交互输入, 或用 --password-stdin)")
+    ap.add_argument("--password-stdin", action="store_true",
+                    help="从 stdin 读取密码(不落 argv; 供脚本/部署使用)")
     ap.add_argument("--save", action="store_true", help="保存凭据到本地(.neu_credentials.json)")
     ap.add_argument("--status", action="store_true", help="查看在线状态与流量")
     ap.add_argument("--logout", action="store_true", help="注销下线")
@@ -1045,6 +1124,25 @@ def main():
                     help="跳过 TLS 证书校验(仅设备时钟无法校准等极端场景; 存在中间人风险)")
     ap.add_argument("--version", action="version", version=f"%(prog)s v{__version__}")
     args = ap.parse_args()
+
+    # 密码入口(PR1): --password-stdin > -p(兼容但告警) > 交互 getpass
+    needs_cred = not (args.test or args.status or args.logout)
+    if args.password_stdin:
+        args.password = sys.stdin.readline().rstrip("\r\n")
+        if not args.password:
+            ap.error("--password-stdin 未读到密码")
+    elif args.password:
+        print("[!] 警告: 命令行 -p 会把密码暴露给进程列表/命令历史; "
+              "建议改用 --password-stdin 或交互输入", file=sys.stderr)
+    elif args.username and needs_cred and sys.stdin.isatty():
+        try:
+            args.password = getpass.getpass("统一身份认证密码: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n[*] 已取消输入", file=sys.stderr)
+            sys.exit(EXIT_TRANSIENT)
+    if needs_cred and args.username and not args.password:
+        ap.error("提供了 -u 但缺少密码: 请交互输入、使用 --password-stdin, "
+                 "或去掉 -u 改用已保存凭据")
 
     global TLS_VERIFY
     if args.insecure:

@@ -51,14 +51,23 @@ if [ -d /etc/systemd ]; then
     echo "[+] NTP已指向 ntp.neu.edu.cn (校内, 免认证可达)"
 fi
 
-# 3. 保存凭据
+# 3. 保存凭据 (密码隐藏输入, 经 stdin 传给脚本, 不进 argv/进程列表)
 echo ""
 echo "--- 输入统一身份认证凭据 (网页登录用的学号密码) ---"
 printf "学号: "
 read -r UNAME
-printf "密码: "
-read -r PWD_
-python3 "$DEST" -u "$UNAME" -p "$PWD_" --save
+printf "密码(输入不回显): "
+if [ -t 0 ]; then
+    stty -echo 2>/dev/null || true
+    trap 'stty echo 2>/dev/null || true' EXIT INT TERM
+fi
+IFS= read -r PWD_ || true
+if [ -t 0 ]; then
+    stty echo 2>/dev/null || true
+fi
+printf '\n'
+printf '%s\n' "$PWD_" | python3 "$DEST" -u "$UNAME" --password-stdin --save
+unset PWD_
 
 # 4. 连接WiFi(开放网络) 并自动连接
 # 注意: 不要显式设置 wifi-sec.key-mgmt none —— NetworkManager 会将 [wifi-security]

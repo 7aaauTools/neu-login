@@ -32,8 +32,11 @@
 ## 快速开始（PC）
 
 ```powershell
-# 一键登录（首次，同时保存凭据）
-python neu_login.py -u 你的学号 -p 你的密码 --save
+# 首次登录并保存凭据（终端下会隐藏输入密码，不进入命令历史）
+python neu_login.py -u 你的学号 --save
+
+# 非交互场景（脚本/CI）：从 stdin 读密码，避免密码进入 argv
+echo '你的密码' | python neu_login.py -u 你的学号 --password-stdin --save
 
 # 之后登录只需
 python neu_login.py
@@ -47,6 +50,8 @@ python neu_login.py --logout
 python neu_login.py --test
 
 # 多设备管理（账号最多 3 台在线，超限登录会被拒）
+# 注意：该接口按门户设计需要提交 md5(密码)；脚本优先 HTTPS，门户不支持时
+# 回退明文 HTTP 并告警（同网段可嗅探/离线爆破，建议优先用网页端设备管理）
 python neu_login.py --devices
 python neu_login.py --kick 172.26.x.x
 
@@ -55,6 +60,7 @@ python test_neu_login.py
 python test_p0_cpython.py
 python test_p0_esp32.py
 python test_esp32_time.py
+python test_p1_credentials.py
 ```
 
 ## ESP32 版
@@ -158,8 +164,11 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 凭据与安全
 
+- **密码入口**：终端下 `-u` 后会 `getpass` 隐藏输入；脚本/CI 用 `--password-stdin`；`-p/--password` 仅兼容保留，并会告警（会进入命令历史/进程列表）
 - 凭据以**明文**保存（每次登录需用原始密码做 RSA 加密，无法加密存储）：Windows = 脚本同目录 `.neu_credentials.json`；Linux root = `/etc/neu/credentials.json`；Linux 普通用户 = `~/.config/neu/credentials.json`
-- Linux 下凭据文件权限为 600，仅文件属主可读（Windows 无此权限模型，共用电脑请注意）
+- POSIX 下凭据文件 `0600`、目录 `0700`，并以“同目录 0600 临时文件 + rename”**原子写入**（不存在“先写后 chmod”的权限窗口）；Windows 无 POSIX 权限模型，仅受 ACL 保护，勿放在共享/云同步目录
+- 凭据文件损坏/字段缺失时不再崩溃，会提示重新 `--save`；POSIX 下权限过宽会打印告警
+- **`--devices` 接口风险**：该接口按门户设计需提交 `md5(密码)`；脚本优先走 HTTPS，门户不支持时回退明文 HTTP 并显式告警（同网段可嗅探 + 无盐 md5 可离线爆破），建议优先使用网页端设备管理
 - **TLS**：两版默认都校验证书（CPython 用系统 CA，ESP32 用内置 CA + `server_hostname` 主机名校验）；证书错误**不再自动降级**（旧行为可被中间人利用），请先校准系统时间（NTP）；仅确认网络可信时才用 `--insecure` 显式关闭校验（CPython 下会同时禁用公钥在线刷新）
 - **SSO 跳转白名单**：两版都会校验：门户走明文 HTTP，CAS 跳转必须为 `https://pass.neu.edu.cn`、ticket 回跳必须为 `ipgw.neu.edu.cn`，防止同网段中间人把登录引导到攻击者服务器
 - **防锁号**：凭据被拒时返回退出码 `3`，`--watch` 立即停止并在 30 分钟内不再尝试 CAS（状态文件与凭据同目录；`--kick` 成功或 `--save` 新凭据会立即解除冷却）；网络/证书类失败按 15s→900s 指数退避，且 10 分钟内最多 3 次登录尝试。设备数超限（E2620）同样以 `3` 退出但**不写冷却**，`--kick` 释放名额后可直接重试
@@ -182,6 +191,7 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
+- **未发布（PR1）** 凭据入口与落盘加固：`-u` 后交互 `getpass` 隐藏输入、新增 `--password-stdin`（`-p` 兼容但告警）；凭据文件改为 0600 原子写 + 目录 0700、坏 JSON/字段缺失容错、POSIX 权限过宽告警、Windows 文案如实；`--devices` 优先 HTTPS、回退明文 HTTP 显式告警
 - **v1.1.2** ESP32 无人值守增强：新增心跳日志（默认每 4 次巡检 ≈ 2 分钟打印一次 `heartbeat online`，便于长时间运行观察；`HEARTBEAT_CHECKS=0` 关闭）；`tools/build_mpy.py` 生成的 `main.py` 支持从设备端 `secrets.py` 读取凭据（凭据不进入仓库与 `.mpy`），`.gitignore` 已排除 `secrets.py`
 - **v1.1.1** ESP32 部署前提修复：
   - 校时：开机自动校时，**HTTP Date 优先**（认证前访问门户读 `Date` 头；实测 ESP32-C3 认证前 NTP UDP/123 会 `ETIMEDOUT`），NTP 兜底；对时失败明确报 `time-invalid` 而不是反复徒劳登录
