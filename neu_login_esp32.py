@@ -60,7 +60,11 @@
 #
 # 时间要求 (CERT_REQUIRED 前提, 无 RTC 设备必读):
 #   ESP32 无电池 RTC, 断电后时钟复位为 2000 年 -> 证书校验因"尚未生效"直接失败。
-#   run_forever() 开机自动用 NTP_HOST(ntp.neu.edu.cn, 认证前可达) 校时;
+#   run_forever() 开机自动校时, 顺序为:
+#     1) HTTP Date: 认证前访问 HTTP_TIME_HOSTS(默认 ipgw.neu.edu.cn),
+#        读响应头 Date 设 RTC —— 校园网认证前门户 HTTP 可达
+#        (实测 ESP32-C3: 认证前 NTP UDP/123 会 ETIMEDOUT, HTTP Date 可用)
+#     2) NTP: 上一步失败时用 NTP_HOST(ntp.neu.edu.cn) 兜底
 #   库模式请先调用 ensure_time()/sync_time(); 设备端自检 (REPL):
 #       import neulib as m
 #       m.wifi_connect()
@@ -68,6 +72,15 @@
 #   self_check() 会对 pass.neu.edu.cn 做两次真实握手: 正确域名应成功、
 #   错误域名必须失败; 若返回 FAIL: hostname-not-verified 说明该固件
 #   未校验主机名, 请勿使用(或改用证书指纹锁定方案)。
+#
+# 部署建议 (内存紧张设备, 如 ESP32-C3 / 无 PSRAM):
+#   设备端现场编译本文件(~48KB 源码)会恶化堆碎片, 导致 mbedtls 在 TLS 握手
+#   解析证书链时报 OSError(-10368, 'MBEDTLS_ERR_X509_ALLOC_FAILED')。
+#   请用 tools/build_mpy.py 预编译成 .mpy 后上传(设备只加载字节码):
+#       pip install mpy-cross==<与固件同版本>   # 设备 print(sys.version) 查看
+#       python tools/build_mpy.py --mpy-cross <path>
+#       mpremote cp dist/neu_login_esp32.mpy :neulib.mpy
+#   实测: 同一块 ESP32-C3, .py 部署握手失败, .mpy 部署证书链+主机名校验正常。
 #
 # 合规: 仅供使用者本人账号的自动登录与个人学习研究使用,
 #       禁止用于对校园网的任何攻击或滥用 (详见仓库 README 免责声明)
@@ -104,8 +117,11 @@ AC_ID = 16                 # 默认AC编号; 实际运行时从劫持URL自动�
 CHECK_INTERVAL = 30         # 在线巡检间隔(秒)
 LED_PIN = 2                 # 板载LED引脚, 不需要则设为 None
 DEBUG = False               # 置 True 打印各步骤服务器原始响应(仅排查用); 正常运行保持 False
-NTP_HOST = "ntp.neu.edu.cn" # 校时服务器(校内, 认证前可达); 无 RTC 设备上电后必须校时
+NTP_HOST = "ntp.neu.edu.cn" # NTP 校时服务器(校内); 注意校园网认证前 UDP/123 常被拦
 NTP_TIMEOUT = 8             # NTP 超时(秒)
+HTTP_TIME_HOSTS = ("ipgw.neu.edu.cn", "202.118.1.87")
+                            # 认证前可达的 HTTP 校时源: 读响应 Date 头(优先于 NTP,
+                            # 实测认证前 NTP UDP/123 会 ETIMEDOUT, 门户 HTTP 可达)
 MIN_VALID_YEAR = 2024       # 设备时间早于该年份视为未对时(证书校验会失败)
 ALLOW_INSECURE_TLS = False  # !安全开关! 默认False=强制校验证书; 仅调试/旧固件应急才可
                             # 显式设为布尔 True: 不校验链路, 每次建连打印警告, 且
@@ -1108,11 +1124,73 @@ def time_ok():
     return MIN_VALID_YEAR <= y <= 2099
 
 
-def sync_time(host=None, timeout=None):
-    """NTP 校时, 返回 (ok, msg)。依赖固件自带 ntptime 模块。
+_MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+           "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
 
-    NTP_HOST 默认用校内服务器: 校园网认证前即可达, 不依赖外网。
+
+def _days_from_civil(y, m, d):
+    """公历日期 -> 自 1970-01-01 起的天数 (Howard Hinnant 算法)"""
+    y -= m <= 2
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    mp = m - 3 if m > 2 else m + 9
+    doy = (153 * mp + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _parse_http_date(raw):
+    """'Wed, 04 Nov 2026 12:42:28 GMT' -> (y, mo, d, h, mi, s) 或 None"""
+    try:
+        parts = raw.replace(",", " ").split()
+        d = int(parts[1])
+        mo = _MONTHS[parts[2]]
+        y = int(parts[3])
+        hms = parts[4].split(":")
+        return (y, mo, d, int(hms[0]), int(hms[1]), int(hms[2]))
+    except Exception:
+        return None
+
+
+def _set_rtc_utc(parts):
+    """把 UTC 时间写入 RTC; datetime 元组顺序: (年,月,日,星期,时,分,秒,亚秒)"""
+    try:
+        from machine import RTC
+    except ImportError:
+        return False
+    try:
+        days = _days_from_civil(parts[0], parts[1], parts[2])
+        wd = (days + 3) % 7          # 1970-01-01 是星期四, Monday=0
+        RTC().datetime((parts[0], parts[1], parts[2], wd,
+                        parts[3], parts[4], parts[5], 0))
+        return True
+    except Exception:
+        return False
+
+
+def sync_time_http(client=None, hosts=None):
+    """用 HTTP Date 响应头校时 (认证前 NTP/UDP123 常被拦, 门户 HTTP 可达)
+
+    HTTPClient 已把响应头键统一小写, 因此读 hs.get("date")。
+    返回 (ok, msg)。
     """
+    c = client or HTTPClient()
+    for host in (hosts or HTTP_TIME_HOSTS):
+        try:
+            st, hs, data = c.request("http://" + host + "/", timeout=8, max_body=1024)
+        except Exception as ex:
+            _dbg("[dbg] http-date %s: %s" % (host, ex))
+            continue
+        parsed = _parse_http_date(hs.get("date"))
+        if not parsed:
+            continue
+        if _set_rtc_utc(parsed) and time_ok():
+            return True, "http-date(%s)" % host
+    return False, "http-date-fail"
+
+
+def sync_time_ntp(host=None, timeout=None):
+    """NTP 校时兜底 (依赖固件 ntptime; 认证前 UDP/123 可能被拦)"""
     host = host or NTP_HOST
     timeout = timeout or NTP_TIMEOUT
     try:
@@ -1136,16 +1214,27 @@ def sync_time(host=None, timeout=None):
     return True, "ntp-ok(%s)" % host
 
 
+def sync_time():
+    """校时: 先 HTTP Date(认证前可达), 再 NTP 兜底。返回 (ok, msg)"""
+    ok, msg = sync_time_http()
+    if ok:
+        return True, msg
+    nok, nmsg = sync_time_ntp()
+    if nok:
+        return True, nmsg
+    return False, "http-date-fail; " + nmsg
+
+
 def ensure_time():
     """确保设备时间可用于 TLS: 已正常则跳过, 否则 NTP 校时。返回 (ok, msg)"""
     if time_ok():
         return True, "time-ok"
     ok, msg = sync_time()
     if ok:
-        print("[time] NTP 校时成功: %s" % msg)
+        print("[time] 校时成功: %s" % msg)
     else:
-        print("[time] NTP 校时失败: %s (请检查 %s / 或 mpremote rtc --set)"
-              % (msg, NTP_HOST))
+        print("[time] 校时失败: %s (HTTP Date/NTP 均不可用; 可 mpremote rtc --set 后重试)"
+              % msg)
     return ok, msg
 
 

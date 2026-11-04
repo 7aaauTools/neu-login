@@ -11,3 +11,6 @@ connection_log_*.txt
 
 # 运行时状态 (认证失败冷却标记)
 .authfail
+
+# .mpy 构建产物 (用 tools/build_mpy.py 本地生成; 与固件版本绑定, 不入库)
+dist/

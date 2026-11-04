@@ -131,31 +131,60 @@ def test_time_ok_never_raises_on_broken_time():
 
 # ---------- sync_time ----------
 
-def test_sync_time_success():
+def test_sync_time_http_success():
+    fake_time = _FakeTime(2000)
+
+    class _Client:
+        def request(self, url, **kw):
+            return 302, {"date": "Wed, 04 Nov 2026 12:42:28 GMT"}, b""
+
+    def fake_set(parts):
+        fake_time.year = parts[0]
+        return True
+
+    with _patched(m, time=fake_time, _set_rtc_utc=fake_set):
+        ok, msg = m.sync_time_http(client=_Client())
+    _check(ok, "HTTP Date 校时应成功: " + msg)
+    _check("http-date" in msg, "应标记来源: " + msg)
+    _eq(fake_time.year, 2026, "RTC 年份")
+
+
+def test_sync_time_http_all_sources_fail():
+    class _BadClient:
+        def request(self, url, **kw):
+            raise OSError("blocked")
+
+    ok, msg = m.sync_time_http(client=_BadClient())
+    _check(not ok and "http-date-fail" in msg, "全部失败应返回 http-date-fail: " + msg)
+
+
+def test_sync_time_ntp_fallback_success():
     fake_time = _FakeTime(2000)
     fake_ntp = _FakeNtp(fake_time)
-    with _patched(m, time=fake_time, NTP_HOST="ntp.neu.edu.cn", NTP_TIMEOUT=8):
+    with _patched(m, time=fake_time, NTP_HOST="ntp.neu.edu.cn", NTP_TIMEOUT=8,
+                  sync_time_http=lambda: (False, "http-date-fail")):
         with _fake_module("ntptime", fake_ntp):
             ok, msg = m.sync_time()
-    _check(ok, "NTP 成功应返回 True: " + msg)
+    _check(ok, "HTTP 失败时应回落 NTP 并成功: " + msg)
     _eq(fake_ntp.calls, 1, "settime 调用次数")
     _eq(fake_ntp.host, "ntp.neu.edu.cn", "ntptime.host")
     _check("ntp-ok" in msg, "成功信息: " + msg)
-    _check(m.time_ok(), "校时后时间应可用")
 
 
-def test_sync_time_failure():
+def test_sync_time_all_fail():
     fake_time = _FakeTime(2000)
     fake_ntp = _FakeNtp(fake_time, fail=True)
-    with _patched(m, time=fake_time, NTP_HOST="ntp.neu.edu.cn"):
+    with _patched(m, time=fake_time, sync_time_http=lambda: (False, "http-date-fail")):
         with _fake_module("ntptime", fake_ntp):
             ok, msg = m.sync_time()
-    _check(not ok, "NTP 失败应返回 False")
-    _check("ntp-fail" in msg, "失败信息应可识别: " + msg)
+    _check(not ok, "两种方式都失败应返回 False")
+    _check("http-date-fail" in msg and "ntp-fail" in msg,
+           "应说明两种方式都失败: " + msg)
 
 
 def test_sync_time_without_ntptime_module():
-    with _patched(m, time=_FakeTime(2000)):
+    with _patched(m, time=_FakeTime(2000),
+                  sync_time_http=lambda: (False, "http-date-fail")):
         sys.modules["ntptime"] = None          # 让 import ntptime 抛 ImportError
         try:
             ok, msg = m.sync_time()
@@ -163,6 +192,23 @@ def test_sync_time_without_ntptime_module():
             sys.modules.pop("ntptime", None)
     _check(not ok, "缺少 ntptime 模块应返回 False 而不是抛 ImportError")
     _check("no-ntptime" in msg, "应提示缺少模块: " + msg)
+
+
+def test_parse_http_date():
+    _eq(m._parse_http_date("Wed, 04 Nov 2026 12:42:28 GMT"),
+        (2026, 11, 4, 12, 42, 28), "标准 RFC1123 Date")
+    _eq(m._parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"),
+        (1970, 1, 1, 0, 0, 0), "epoch")
+    _eq(m._parse_http_date("garbage"), None, "非法输入应返回 None")
+    _eq(m._parse_http_date(None), None, "None 输入应返回 None")
+
+
+def test_days_from_civil_known_dates():
+    _eq(m._days_from_civil(1970, 1, 1), 0, "epoch")
+    _eq(m._days_from_civil(2000, 1, 1), 10957, "2000-01-01")
+    _eq(m._days_from_civil(2024, 1, 1), 19723, "2024-01-01")
+    _eq((m._days_from_civil(2000, 1, 1) + 3) % 7, 5,
+        "2000-01-01 是星期六(Monday=0 时为 5)")
 
 
 # ---------- ensure_time ----------
@@ -181,7 +227,8 @@ def test_ensure_time_skips_when_time_ok():
 def test_ensure_time_attempts_sync_when_invalid():
     fake_time = _FakeTime(2000)
     fake_ntp = _FakeNtp(fake_time)
-    with _patched(m, time=fake_time):
+    with _patched(m, time=fake_time,
+                  sync_time_http=lambda: (False, "http-date-fail")):
         with _fake_module("ntptime", fake_ntp):
             with _quiet():
                 ok, msg = m.ensure_time()

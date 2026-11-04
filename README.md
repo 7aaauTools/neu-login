@@ -25,6 +25,7 @@
 | `test_neu_login.py` | 离线单元测试（不联网、不需要凭据） |
 | `test_p0_cpython.py` / `test_p0_esp32.py` | P0 安全/健壮性回归测试（离线，覆盖网络异常收敛、认证失败分级退避、SSO 白名单、TLS 证书校验与公钥刷新门禁） |
 | `test_esp32_time.py` | ESP32 时间同步与设备自检的离线测试（NTP 前置条件、时间异常拒绝登录、self_check 结构） |
+| `tools/build_mpy.py` | 把 ESP32 版预编译为 `.mpy` 并生成独立入口（ESP32-C3 等内存紧张设备**强烈建议**，见下文） |
 | `capture_connection.ps1` | Windows 连接过程日志采集脚本（用于连接过程分析与排障） |
 | `debian/` | Linux 主机一键部署（Debian 及兼容发行版；PC / 服务器 / 树莓派 / 开发板 / 随身 WiFi 设备），见 [`debian/部署指南.md`](debian/部署指南.md) |
 
@@ -64,6 +65,16 @@ python test_esp32_time.py
 2. 上传到 ESP32 并命名为 `main.py`（mpremote / Thonny / ampy 均可）
 3. 上电自动连 WiFi 并登录；板载 LED 亮 = 在线，灭 = 掉线
 4. 同一文件也可直接在 PC 上调试：`python neu_login_esp32.py check`
+5. **内存紧张设备（ESP32-C3 / 无 PSRAM）强烈建议用 `.mpy` 部署**：设备端现场编译 ~48KB 源码会恶化堆碎片，导致 TLS 握手解析证书链时报 `OSError(-10368, 'MBEDTLS_ERR_X509_ALLOC_FAILED')`（实测同一块 C3：`.py` 握手失败、`.mpy` 正常）。PC 上预编译后上传：
+
+```bash
+pip install mpy-cross==<与设备固件同版本>    # 设备上 print(sys.version) 查看，如 1.29.0.post2
+python tools/build_mpy.py --mpy-cross <mpy-cross 可执行文件路径>
+mpremote cp dist/neu_login_esp32.mpy :neulib.mpy
+mpremote cp dist/main.py :main.py
+```
+
+（修改 CONFIG 后需重新生成 `.mpy`；库模式集成只需上传 `.mpy` 并 `import neulib`，不需要 `main.py`）
 
 > **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**：`run_forever()` 开机自动用 `NTP_HOST`（默认 `ntp.neu.edu.cn`，认证前可达）校时，失败会明确报 `time-invalid`；也可手动 `mpremote rtc --set`。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
 > `openssl s_client -showcerts -connect pass.neu.edu.cn:443` 更新 `CA_CERT_PEM`。
@@ -158,7 +169,10 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
-- **v1.1.1** ESP32 部署前提修复：开机自动 NTP 校时（`CERT_REQUIRED` 依赖设备时钟，无 RTC 设备断电后必须校时），对时失败明确报 `time-invalid` 而不是反复徒劳登录；新增设备端 `self_check()`（TLS 模式/CA/时间/主机名校验/剩余堆）与离线测试 `test_esp32_time.py`
+- **v1.1.1** ESP32 部署前提修复：
+  - 校时：开机自动校时，**HTTP Date 优先**（认证前访问门户读 `Date` 头；实测 ESP32-C3 认证前 NTP UDP/123 会 `ETIMEDOUT`），NTP 兜底；对时失败明确报 `time-invalid` 而不是反复徒劳登录
+  - 部署：新增 `tools/build_mpy.py`，ESP32-C3 等内存紧张设备用 `.mpy` 预编译部署，避免设备端编译造成 TLS 握手 `MBEDTLS_ERR_X509_ALLOC_FAILED`（实测 `.py` 失败、`.mpy` 正常）
+  - 新增设备端 `self_check()`（TLS 模式/CA/时间/主机名是否真的被校验/剩余堆）与离线测试 `test_esp32_time.py`
 - **v1.1** 安全与健壮性修复（P0）：
   - CPython：网络异常统一收敛，`--watch` 不再被一次网络抖动杀死；认证失败分级（auth/transient/config/limit）+ 指数退避 + 防锁号守卫 + 登录限流；SSO 跳转与 ticket 回跳强制白名单；证书错误不再自动降级，`--insecure` 显式关闭并禁用公钥刷新
   - ESP32：默认强制 TLS 证书链与主机名校验（内置 GlobalSign CA，`server_hostname` 校验主机名），校验失败不降级；`ALLOW_INSECURE_TLS=True` 时禁用公钥在线刷新；同步实现 SSO 跳转白名单；`ensure_online()` 永不抛异常
