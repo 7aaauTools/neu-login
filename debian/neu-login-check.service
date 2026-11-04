@@ -6,7 +6,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
 ExecStart=/usr/bin/python3 /usr/local/bin/neu_login.py
 # 脚本自带完整自愈: 不在线则登录, 幽灵会话则注销重建, 在线则退出
-# 最坏路径(双探测+AC检测+CAS往返+轮询确认+幽灵注销重建)可逼近90s, 留足余量
+# 退出码: 0=在线/成功  2=网络暂时性失败(可重试)  3=凭据/账号错误(重试无意义)
+# 认证被拒后脚本会写 .authfail 状态文件, 30 分钟内后续巡检直接跳过, 避免锁号
+# 最坏网络路径(双探测+AC检测+CAS往返+轮询确认+幽灵注销重建)实测约 103s, 留足余量
 TimeoutStartSec=180
