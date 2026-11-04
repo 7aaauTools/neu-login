@@ -125,6 +125,10 @@ HTTP_TIME_HOSTS = ("ipgw.neu.edu.cn", "202.118.1.87")
 MIN_VALID_YEAR = 2024       # 设备时间早于该年份视为未对时(证书校验会失败)
 HEARTBEAT_CHECKS = 4        # 每 N 次巡检(默认30s/次)打印一次心跳日志; 0=关闭
                             # (无人值守时用于确认主循环仍在运行)
+AUTH_COOLDOWN_SEC = 1800    # A24: 凭据被拒后暂停 CAS 的时长(秒), 避免错误密码
+                            # 每 30s 重试(约120次/小时)触发统一身份认证锁号/风控
+LIMIT_COOLDOWN_SEC = 600    # A24: E2620(账号在线设备数超限)后暂停 CAS 的时长(秒)
+MAX_BACKOFF = 1800          # A24: 暂时性失败指数退避上限(秒): 30→60→…→1800
 ALLOW_INSECURE_TLS = False  # !安全开关! 默认False=强制校验证书; 仅调试/旧固件应急才可
                             # 显式设为布尔 True: 不校验链路, 每次建连打印警告, 且
                             # 同时禁用公钥在线刷新 (详见文件头 TLS 章节)
@@ -191,6 +195,8 @@ WD9f
 # ================================================
 
 DETECTED_AC_ID = None       # 运行时检测到的本网段AC编号 (见 detect_ac_id)
+_COOLDOWN_UNTIL = None      # A24 认证冷却截止时刻(time.time()); None=无冷却
+_COOLDOWN_KIND = None       # A24 冷却原因: "auth" / "limit"
 
 PORTAL = "ipgw.neu.edu.cn"
 CAS_JS_URL = "https://pass.neu.edu.cn/tpass/comm/neu/js/login_neu.js"
@@ -1019,39 +1025,140 @@ def cas_login(c, username, password, service_url, n, e):
 
 def complete_sso(c, ticket_url):
     """第三步: 携带 ticket 回门户校验, 并访问成功页完成 AC 放行
-    若门户拒绝建会话, DEBUG 模式会打印原因 (E2620=账号在线设备数超限)"""
+
+    返回 (kind, msg): kind ∈ {"ok","limit","transient","auth"}。
+    - "limit"     : 门户响应含 E2620 = 账号在线设备数超限 (A24: 必须停止重试)
+    - "auth"      : ticket 回跳地址非法 = 安全中止(疑似中间人), 不写凭据冷却
+    - "transient" : 门户校验网络异常/非 2xx (不致命, 由后续在线验证判定)
+    - "ok"        : 成功页收尾失败不致命, 仍返回 ok (与原语义一致)
+    """
     try:
         _validate_ticket_url(ticket_url)      # P0-4: 回跳地址白名单
     except ValueError as ex:
         _dbg("[dbg] ticket reject: %s" % ex)
-        return
+        return "auth", "ticket-reject:" + str(ex)
     i = ticket_url.find("?")
     q = ticket_url[i + 1:] if i >= 0 else ""
+    kind = "ok"
+    msg = ""
+    data = None
+    st = 0
     try:
         st, hs, data = c.request("http://" + PORTAL + "/v1/srun_portal_sso?" + q)
-        if DEBUG:
-            body = data[:200].decode() if data else ""
-            _dbg("[dbg] sso-validate HTTP %d %s" % (st, body))
-            if "E2620" in body:
-                _dbg("[dbg] E2620: 超出账号允许在线设备数! PC端执行"
-                     " 'python3 neu_login.py --devices' 查看, '--kick IP' 踢闲置设备")
     except Exception as ex:
         _dbg("[dbg] sso-validate exc=%s" % ex)
+        kind = "transient"
+        msg = "sso-validate-exc:" + str(ex)
+    if data and data.find(b"E2620") >= 0:
+        # A24: 设备数超限 => 上层写 LIMIT_COOLDOWN_SEC 冷却, 期间不再请求 SSO
+        kind = "limit"
+        msg = "E2620: 账号在线设备数超限"
+    elif kind == "ok" and st >= 400:
+        kind = "transient"
+        msg = "sso-validate HTTP %d" % st
+    if DEBUG:
+        try:
+            body = data[:200].decode() if data else ""
+        except Exception:
+            body = ""
+        _dbg("[dbg] sso-validate HTTP %d %s" % (st, body))
     # 浏览器流程收尾: 认证成功后跳 srun_portal_success, 完成 AC 放行
     try:
         c.request("http://" + PORTAL + "/srun_portal_success?ac_id=%d" % _cur_acid())
     except Exception:
         pass
+    return kind, msg
 
 
-def login(username, password):
+# ---------- A24: 认证失败分类 / 冷却 / 指数退避 ----------
+# 背景: 原实现里错误密码每 CHECK_INTERVAL(30s) 就重试一次 CAS(约120次/小时),
+# 极易触发统一身份认证的锁号/风控。现在失败按 kind 分类: 凭据类写入冷却
+# (冷却期内 _login_impl 开头直接返回, 零网络请求), 暂时性失败指数退避,
+# 登录成功立即清除冷却。
+
+def _now():
+    """当前时间戳(秒, 仅冷却计算用); 时钟异常时退化为 0, 保证永不抛"""
+    try:
+        return time.time()
+    except Exception:
+        return 0
+
+
+def _cooldown_remaining():
+    """冷却剩余秒数; 0=不在冷却期 (只读, 无副作用)"""
+    if _COOLDOWN_UNTIL is None:
+        return 0
+    left = _COOLDOWN_UNTIL - _now()
+    return left if left > 0 else 0
+
+
+def _set_cooldown(kind, secs):
+    """开启认证冷却: 冷却期内 _login_impl 直接返回, 不发起任何 CAS 请求"""
+    global _COOLDOWN_UNTIL, _COOLDOWN_KIND
+    _COOLDOWN_UNTIL = _now() + secs
+    _COOLDOWN_KIND = kind
+
+
+def _clear_cooldown():
+    """清除认证冷却 (登录成功时调用; 测试也用它复位)"""
+    global _COOLDOWN_UNTIL, _COOLDOWN_KIND
+    _COOLDOWN_UNTIL = None
+    _COOLDOWN_KIND = None
+
+
+def _next_backoff(cur):
+    """暂时性失败的下一轮等待秒数 (纯函数, 便于测试): 30→60→…→MAX_BACKOFF"""
+    nxt = cur * 2
+    if nxt < CHECK_INTERVAL:
+        nxt = CHECK_INTERVAL
+    if nxt > MAX_BACKOFF:
+        nxt = MAX_BACKOFF
+    return nxt
+
+
+def _fail_kind(err):
+    """失败信息 -> kind (纯函数, 便于测试)
+
+    auth     : CAS 明确拒绝凭据 (WRONG_CREDENTIAL / "CAS: ..." 错误页),
+               或 sso-reject 安全中止 (疑似中间人, 不写凭据冷却)
+    limit    : E2620 账号在线设备数超限 (complete_sso 返回 "limit:")
+    config   : KEY_ROTATED 且无法自动恢复 (需人工更新 PUBKEY_B64)
+    transient: 其余网络/流程暂时性失败 (no-lt/no-redirect/no-ticket/
+               time-invalid/verify-fail/网络异常等), 指数退避后重试
+    """
+    if not err:
+        return "transient"
+    if err == "WRONG_CREDENTIAL" or err[:5] == "CAS: ":
+        return "auth"
+    if err[:10] == "sso-reject":
+        return "auth"
+    if err[:6] == "limit:":
+        return "limit"
+    if err == "KEY_ROTATED" or err[:11] == "key-rotated":
+        return "config"
+    return "transient"
+
+
+def _login_impl(username, password):
+    """登录实现 (公共 API 内部使用), 返回 (ok, msg, kind)
+
+    kind ∈ {"ok","auth","limit","config","transient"} (见 _fail_kind)。
+    A24: 冷却期内直接返回 ("cooldown:<kind>"), 不发起任何网络请求 —— 尤其
+    绝不提交 CAS 凭据, 从根上避免错误密码高频重试导致账号被锁。
+    """
+    left = _cooldown_remaining()
+    if left > 0:
+        k = _COOLDOWN_KIND or "auth"
+        return False, "cooldown:" + k, k
+
     c = HTTPClient()
     info = check_online(c)
     if info:
         # 双重校验: 账面在线但流量被劫持 => 幽灵会话, 注销重建
         probe = probe_internet(c)
         if probe == "ok":
-            return True, "online:" + info[0] + "@" + info[8]
+            _clear_cooldown()
+            return True, "online:" + info[0] + "@" + info[8], "ok"
         if probe == "hijacked":
             print("[login] ghost session, rebuild")
             try:
@@ -1059,20 +1166,23 @@ def login(username, password):
             except Exception:
                 pass
         else:
-            return True, "online:" + info[0] + "@" + info[8] + " probe-unknown"
+            _clear_cooldown()
+            return True, "online:" + info[0] + "@" + info[8] + " probe-unknown", "ok"
 
     # 关键: 检测本网段真实AC编号 (不同网段由不同AC管辖, 编号错则放行失败)
     detect_ac_id(c)
 
     redirect = get_sso_redirect(c)
     if not redirect:
-        return False, "no-redirect"
+        return False, "no-redirect", "transient"
     try:
         _validate_cas_redirect(redirect)      # P0-4: 明文 HTTP 返回的地址先过白名单
         redirect = fix_service_url(redirect)
         _validate_cas_redirect(redirect)
     except ValueError as ex:
-        return False, "sso-reject:" + str(ex)
+        # 安全中止: 未发送任何凭据, 归为 auth 以便提示"疑似中间人", 但不写
+        # 凭据冷却(换网/重启后应允许立即重试)
+        return False, "sso-reject:" + str(ex), "auth"
 
     n, e = get_key()
     # 证书校验前提: 设备时间必须正确, 否则 CAS 的 TLS 握手必然失败
@@ -1081,32 +1191,56 @@ def login(username, password):
         tok, tmsg = ensure_time()
         if not tok:
             return False, ("time-invalid: 设备时间不可用于 TLS 证书校验, "
-                           "请先 NTP 校时或 mpremote rtc --set (%s)" % tmsg)
+                           "请先 NTP 校时或 mpremote rtc --set (%s)" % tmsg), "transient"
     ticket_url, err = cas_login(c, username, password, redirect, n, e)
     if err == "KEY_ROTATED":
         # 服务端解密失败 => 公钥可能已轮换; 仅校验证书链路允许在线刷新
         if ALLOW_INSECURE_TLS is True:
-            return False, "key-rotated: 需手动更新内置 PUBKEY_B64 (不校验模式下在线刷新已禁用)"
+            return False, "key-rotated: 需手动更新内置 PUBKEY_B64 (不校验模式下在线刷新已禁用)", "config"
         try:
             n, e = get_key(c, refresh=True)
             ticket_url, err = cas_login(c, username, password, redirect, n, e)
         except Exception as ex:
-            return False, "key-refresh-fail:" + str(ex)
+            return False, "key-refresh-fail:" + str(ex), "transient"
     if not ticket_url:
-        return False, err or "cas-fail"
+        err = err or "cas-fail"
+        kind = _fail_kind(err)
+        if kind == "auth":
+            # A24: 凭据被拒 -> 冷却 AUTH_COOLDOWN_SEC; 冷却期内零 CAS 请求
+            _set_cooldown("auth", AUTH_COOLDOWN_SEC)
+        return False, err, kind
     _dbg("[dbg] ticket %s" % ticket_url[:80])
 
-    complete_sso(c, ticket_url)
+    sso_kind, sso_msg = complete_sso(c, ticket_url)
+    if sso_kind == "limit":
+        # A24: E2620 设备数超限 -> 冷却 LIMIT_COOLDOWN_SEC (PC端踢闲置设备)
+        _set_cooldown("limit", LIMIT_COOLDOWN_SEC)
+        return False, "limit: " + sso_msg, "limit"
+    if sso_kind == "auth":
+        return False, "sso-reject:" + sso_msg, "auth"
+    # transient: 门户校验失败不致命, 继续在线轮询判定 (与原语义一致)
+
     # 网关放行可能延迟, 轮询: 在线状态 + 真实联网双确认
     for _ in range(5):
         info = check_online(c)
         if info:
             probe = probe_internet(c)
             if probe == "hijacked":
-                return False, "ghost-after-login"
-            return True, "login-ok:" + info[0] + "@" + info[8]
+                return False, "ghost-after-login", "transient"
+            _clear_cooldown()
+            return True, "login-ok:" + info[0] + "@" + info[8], "ok"
         time.sleep(2)
-    return False, "verify-fail"
+    return False, "verify-fail", "transient"
+
+
+def login(username, password):
+    """登录 (公共 API): 返回 (ok, msg), 签名与返回结构保持不变
+
+    A24: 失败分类/冷却/退避由 _login_impl 内部处理; 凭据被拒后会进入冷却,
+    冷却期内再次调用直接返回 (False, "cooldown:auth"), 不发起 CAS 请求。
+    """
+    ok, msg, _kind = _login_impl(username, password)
+    return ok, msg
 
 
 # ==================== 设备时间 (CERT_REQUIRED 前提) ====================
@@ -1404,10 +1538,51 @@ def wifi_connect(ssid=WIFI_SSID, timeout=25):
     return sta
 
 
+def _login_safe(username, password):
+    """run_forever 用: 调用 _login_impl 并把异常收敛为 (ok, msg, kind), 永不抛"""
+    try:
+        return _login_impl(username, password)
+    except MemoryError:
+        gc.collect()
+        return False, "MemoryError: 堆内存耗尽, 已 gc", "transient"
+    except Exception as ex:
+        try:
+            return False, "exc:" + str(ex), "transient"
+        except Exception:
+            return False, "exc", "transient"
+
+
+def _report_fail(kind, msg):
+    """run_forever 失败处置: 打印原因与建议, 返回 True=继续 / False=停止主循环
+
+    A24: 冷却由 _login_impl 保证期间不发起 CAS; 本函数只负责提示, 不改状态。
+    """
+    if kind == "auth":
+        if _cooldown_remaining() > 0:
+            print("[auth] 凭据被拒, 暂停 CAS %d 分钟以免账号被锁; "
+                  "请核对密码后重启设备" % (AUTH_COOLDOWN_SEC // 60))
+        else:
+            # sso-reject 属安全中止: 未发送凭据 => 不写凭据冷却, 只提示疑似中间人
+            print("[auth] 安全中止: 疑似中间人, 未发送凭据; 请检查网络 (%s)" % msg)
+        return True
+    if kind == "limit":
+        print("[limit] E2620 账号在线设备数超限, 暂停 CAS %d 分钟; PC端执行 "
+              "'python3 neu_login.py --devices' 查看, '--kick IP' 踢闲置设备"
+              % (LIMIT_COOLDOWN_SEC // 60))
+        return True
+    if kind == "config":
+        print("[cfg] KEY_ROTATED: 公钥与 CAS 服务端不匹配且无法自动恢复; 若为"
+              " ALLOW_INSECURE_TLS=True 需手动更新 PUBKEY_B64; 已停止自动登录")
+        return False
+    print("[retry] 暂时性失败: %s (指数退避重试)" % msg)
+    return True
+
+
 def run_forever():
     if not USERNAME or not PASSWORD:
         print("[cfg] ERROR: 请先在文件顶部 CONFIG 填入 USERNAME / PASSWORD")
         return
+    delay = CHECK_INTERVAL
     while True:
         sta = wifi_connect()
         if not sta:
@@ -1416,34 +1591,63 @@ def run_forever():
         gc.collect()
         print("[boot] v%s, heap free%s" % (__version__, _mems()))
         ensure_time()          # 证书校验前提: 无 RTC 设备上电后必须 NTP 校时
-        try:
-            ok, msg = login(USERNAME, PASSWORD)
-        except Exception as ex:
-            ok, msg = False, "exc:" + str(ex)
+        ok, msg, kind = _login_safe(USERNAME, PASSWORD)
         print("[%s] %s %s%s" % (_ts(), "OK " if ok else "ERR", msg, _mems()))
         led(ok)
+        if ok:
+            delay = CHECK_INTERVAL
+        else:
+            if not _report_fail(kind, msg):
+                led(False)
+                return
+            delay = CHECK_INTERVAL       # 首次重试仍按 CHECK_INTERVAL, 之后指数退避
         checks = 0
+        last_note = 0
         while sta.isconnected():
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(delay)
             gc.collect()
             checks += 1
             try:
                 info = check_online()
-                if info:
+                ghost = False
+                if info and probe_internet() == "hijacked":
                     # 双重校验: 账面在线 + 真实联网, 捕获幽灵会话
-                    if probe_internet() == "hijacked":
-                        print("[watch] ghost session, rebuild%s" % _mems())
-                        ok, msg = login(USERNAME, PASSWORD)
+                    print("[watch] ghost session, rebuild%s" % _mems())
+                    ghost = True
+                if info and not ghost:
+                    online = True
+                    delay = CHECK_INTERVAL      # 已在线: 复位暂时性退避
+                else:
+                    online = False
+                    left = _cooldown_remaining()
+                    if left > 0:
+                        # A24: 冷却期内只做在线状态检查与心跳, 绝不发起 CAS
+                        now = _now()
+                        if now - last_note >= 300:
+                            last_note = now
+                            print("[watch] 冷却中(%s), 剩余%d分, 跳过 CAS%s"
+                                  % (_COOLDOWN_KIND, left // 60, _mems()))
+                    else:
+                        if not ghost:
+                            print("[watch] offline, relogin%s" % _mems())
+                        ok, msg, kind = _login_safe(USERNAME, PASSWORD)
                         print("[%s] %s %s%s" % (_ts(), "OK " if ok else "ERR", msg, _mems()))
                         led(ok)
-                else:
-                    print("[watch] offline, relogin%s" % _mems())
-                    ok, msg = login(USERNAME, PASSWORD)
-                    print("[%s] %s %s%s" % (_ts(), "OK " if ok else "ERR", msg, _mems()))
-                    led(ok)
+                        if ok:
+                            delay = CHECK_INTERVAL
+                        else:
+                            if not _report_fail(kind, msg):
+                                led(False)
+                                return
+                            if kind == "transient" or (
+                                    kind == "auth" and _cooldown_remaining() <= 0):
+                                # 暂时性失败 / sso-reject(无凭据冷却) 均指数退避
+                                delay = _next_backoff(delay)
+                            else:
+                                delay = CHECK_INTERVAL
                 if HEARTBEAT_CHECKS and checks % HEARTBEAT_CHECKS == 0:
                     print("[%s] heartbeat %s%s" % (
-                        _ts(), "online" if info else "offline", _mems()))
+                        _ts(), "online" if online else "offline", _mems()))
             except MemoryError:
                 # 堆内存耗尽(碎片化): 立即回收, 下一轮巡检重试 (常驻场景必须自愈)
                 gc.collect()
