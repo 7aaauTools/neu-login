@@ -107,7 +107,7 @@ import ssl
 import binascii
 
 _IS_UPY = sys.implementation.name == "micropython"
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 # ==================== CONFIG ====================
 WIFI_SSID = "NEU-2.4G"      # 开放网络, 无需密码

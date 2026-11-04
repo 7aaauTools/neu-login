@@ -25,6 +25,8 @@
 | `test_neu_login.py` | 离线单元测试（不联网、不需要凭据） |
 | `test_p0_cpython.py` / `test_p0_esp32.py` | P0 安全/健壮性回归测试（离线，覆盖网络异常收敛、认证失败分级退避、SSO 白名单、TLS 证书校验与公钥刷新门禁） |
 | `test_esp32_time.py` | ESP32 时间同步与设备自检的离线测试（NTP 前置条件、时间异常拒绝登录、self_check 结构） |
+| `test_p1_credentials.py` | PR1 凭据入口/落盘测试（--password-stdin/getpass、原子写与权限、坏 JSON 容错、--devices HTTPS 优先） |
+| `test_esp32_auth.py` | A24 ESP32 认证失败冷却/退避测试（冷却期零 CAS、E2620、指数退避、run_forever 接线） |
 | `tools/build_mpy.py` | 把 ESP32 版预编译为 `.mpy` 并生成独立入口（ESP32-C3 等内存紧张设备**强烈建议**，见下文） |
 | `capture_connection.ps1` | Windows 连接过程日志采集脚本（用于连接过程分析与排障） |
 | `debian/` | Linux 主机一键部署（Debian 及兼容发行版；PC / 服务器 / 树莓派 / 开发板 / 随身 WiFi 设备），见 [`debian/部署指南.md`](debian/部署指南.md) |
@@ -61,6 +63,7 @@ python test_p0_cpython.py
 python test_p0_esp32.py
 python test_esp32_time.py
 python test_p1_credentials.py
+python test_esp32_auth.py
 ```
 
 ## ESP32 版
@@ -137,6 +140,8 @@ while True:
 
 > **内存注意**：登录瞬时堆占用较大（TLS + RSA-2048 大整数运算）。请在主循环中**顺序调用** `ensure_online()`，不要与业务逻辑并发执行，也不要在中断回调中调用；业务较重的应用建议选用带 PSRAM 的 ESP32 模组。
 
+> **认证失败保护（A24）**：凭据被拒后暂停 CAS **30 分钟**（`AUTH_COOLDOWN_SEC`），E2620 设备超限暂停 **10 分钟**（`LIMIT_COOLDOWN_SEC`）；暂时性失败按 30→60→…→1800s 指数退避（`MAX_BACKOFF`）。冷却期内只做在线检查与心跳、**绝不提交 CAS 凭据**；冷却状态在内存中，断电/重启即清除（核对密码后重启即可重试）。
+
 ## Linux 主机部署（Debian 及兼容发行版）
 
 见 [`debian/部署指南.md`](debian/部署指南.md)。核心方案 `sudo sh setup.sh` 一键完成，之后：
@@ -191,7 +196,10 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
-- **未发布（PR1）** 凭据入口与落盘加固：`-u` 后交互 `getpass` 隐藏输入、新增 `--password-stdin`（`-p` 兼容但告警）；凭据文件改为 0600 原子写 + 目录 0700、坏 JSON/字段缺失容错、POSIX 权限过宽告警、Windows 文案如实；`--devices` 优先 HTTPS、回退明文 HTTP 显式告警
+- **v1.2.0** 凭据入口/落盘加固 + ESP32 认证失败保护：
+  - **PR1（A1/A2/A3）**：`-u` 后交互 `getpass` 隐藏输入、新增 `--password-stdin`（`-p` 兼容但告警）；凭据文件 0600 原子写 + 目录 0700、坏 JSON/字段缺失容错、POSIX 权限过宽告警、Windows 文案如实；`--devices` 优先 HTTPS、回退明文 HTTP 显式告警
+  - **A24（ESP32）**：凭据被拒暂停 CAS 30 分钟（`AUTH_COOLDOWN_SEC`）、E2620 设备超限 10 分钟（`LIMIT_COOLDOWN_SEC`）；暂时性失败指数退避 30→1800s（`MAX_BACKOFF`）；冷却期零 CAS 请求，只做在线检查+心跳；`complete_sso` 返回 kind，`run_forever` 按失败类型提示/停止
+  - 新增 `test_p1_credentials.py`（13 条）与 `test_esp32_auth.py`（26 条）离线测试
 - **v1.1.2** ESP32 无人值守增强：新增心跳日志（默认每 4 次巡检 ≈ 2 分钟打印一次 `heartbeat online`，便于长时间运行观察；`HEARTBEAT_CHECKS=0` 关闭）；`tools/build_mpy.py` 生成的 `main.py` 支持从设备端 `secrets.py` 读取凭据（凭据不进入仓库与 `.mpy`），`.gitignore` 已排除 `secrets.py`
 - **v1.1.1** ESP32 部署前提修复：
   - 校时：开机自动校时，**HTTP Date 优先**（认证前访问门户读 `Date` 头；实测 ESP32-C3 认证前 NTP UDP/123 会 `ETIMEDOUT`），NTP 兜底；对时失败明确报 `time-invalid` 而不是反复徒劳登录

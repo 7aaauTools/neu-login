@@ -73,7 +73,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 PORTAL = "http://ipgw.neu.edu.cn"
 CAS_LOGIN_JS = "https://pass.neu.edu.cn/tpass/comm/neu/js/login_neu.js"
