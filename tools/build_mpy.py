@@ -39,9 +39,18 @@ SRC = os.path.join(ROOT, "neu_login_esp32.py")
 OUT = os.path.join(ROOT, "dist")
 
 MAIN_PY = """# 独立运行入口: 由 tools/build_mpy.py 生成
+# 凭据放在设备上的 secrets.py (不要提交仓库, 已列入 .gitignore):
+#     USERNAME = "学号"
+#     PASSWORD = "密码"
 # 模块已预编译为 neulib.mpy, 避免设备端现场编译大文件造成堆碎片
 # (ESP32-C3 上会导致 mbedtls MBEDTLS_ERR_X509_ALLOC_FAILED)
 import neulib
+try:
+    import secrets
+    neulib.USERNAME = secrets.USERNAME
+    neulib.PASSWORD = secrets.PASSWORD
+except ImportError:
+    pass
 
 neulib.run_forever()
 """
@@ -94,6 +103,10 @@ def main():
 部署 (ESP32-C3 等内存紧张设备):
     mpremote cp dist/neu_login_esp32.mpy :neulib.mpy
     mpremote cp dist/main.py :main.py
+    # 首次部署还需在设备上创建 secrets.py (凭据, 不要提交仓库):
+    #   USERNAME = "学号"
+    #   PASSWORD = "密码"
+    # 然后:
     mpremote reset
 库模式: 只需上传 .mpy, 业务代码 import neulib
 """)

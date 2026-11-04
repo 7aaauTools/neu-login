@@ -107,7 +107,7 @@ import ssl
 import binascii
 
 _IS_UPY = sys.implementation.name == "micropython"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # ==================== CONFIG ====================
 WIFI_SSID = "NEU-2.4G"      # 开放网络, 无需密码
@@ -123,6 +123,8 @@ HTTP_TIME_HOSTS = ("ipgw.neu.edu.cn", "202.118.1.87")
                             # 认证前可达的 HTTP 校时源: 读响应 Date 头(优先于 NTP,
                             # 实测认证前 NTP UDP/123 会 ETIMEDOUT, 门户 HTTP 可达)
 MIN_VALID_YEAR = 2024       # 设备时间早于该年份视为未对时(证书校验会失败)
+HEARTBEAT_CHECKS = 4        # 每 N 次巡检(默认30s/次)打印一次心跳日志; 0=关闭
+                            # (无人值守时用于确认主循环仍在运行)
 ALLOW_INSECURE_TLS = False  # !安全开关! 默认False=强制校验证书; 仅调试/旧固件应急才可
                             # 显式设为布尔 True: 不校验链路, 每次建连打印警告, 且
                             # 同时禁用公钥在线刷新 (详见文件头 TLS 章节)
@@ -1420,9 +1422,11 @@ def run_forever():
             ok, msg = False, "exc:" + str(ex)
         print("[%s] %s %s%s" % (_ts(), "OK " if ok else "ERR", msg, _mems()))
         led(ok)
+        checks = 0
         while sta.isconnected():
             time.sleep(CHECK_INTERVAL)
             gc.collect()
+            checks += 1
             try:
                 info = check_online()
                 if info:
@@ -1437,6 +1441,9 @@ def run_forever():
                     ok, msg = login(USERNAME, PASSWORD)
                     print("[%s] %s %s%s" % (_ts(), "OK " if ok else "ERR", msg, _mems()))
                     led(ok)
+                if HEARTBEAT_CHECKS and checks % HEARTBEAT_CHECKS == 0:
+                    print("[%s] heartbeat %s%s" % (
+                        _ts(), "online" if info else "offline", _mems()))
             except MemoryError:
                 # 堆内存耗尽(碎片化): 立即回收, 下一轮巡检重试 (常驻场景必须自愈)
                 gc.collect()

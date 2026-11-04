@@ -76,7 +76,20 @@ mpremote cp dist/main.py :main.py
 
 （修改 CONFIG 后需重新生成 `.mpy`；库模式集成只需上传 `.mpy` 并 `import neulib`，不需要 `main.py`）
 
-> **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**：`run_forever()` 开机自动用 `NTP_HOST`（默认 `ntp.neu.edu.cn`，认证前可达）校时，失败会明确报 `time-invalid`；也可手动 `mpremote rtc --set`。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
+6. **开机自启的完整结构**（`.mpy` 部署推荐）：`neulib.mpy` + `main.py` + `secrets.py`。`main.py` 由 `tools/build_mpy.py` 自动生成，会从设备端 `secrets.py` 读取凭据后进入主循环，因此**凭据不进入仓库、也不进入 `.mpy`**（`.gitignore` 已排除 `secrets.py`）：
+
+```python
+# secrets.py (只存在设备 flash 上, 切勿提交仓库)
+USERNAME = "你的学号"
+PASSWORD = "你的密码"
+```
+
+```bash
+mpremote cp secrets.py :secrets.py     # 首次/改密码后
+mpremote reset                         # 上电自动运行
+```
+
+> **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**：`run_forever()` 开机自动校时（HTTP `Date` 优先、NTP 兜底，见下），失败会明确报 `time-invalid`；也可手动 `mpremote rtc --set`。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
 > `openssl s_client -showcerts -connect pass.neu.edu.cn:443` 更新 `CA_CERT_PEM`。
 
 **上机自检（真机必做一次）**：把文件以 `neulib.py` 上传（**不要命名 `main.py`**，否则上电直接进主循环），然后串口 REPL：
@@ -169,6 +182,7 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
+- **v1.1.2** ESP32 无人值守增强：新增心跳日志（默认每 4 次巡检 ≈ 2 分钟打印一次 `heartbeat online`，便于长时间运行观察；`HEARTBEAT_CHECKS=0` 关闭）；`tools/build_mpy.py` 生成的 `main.py` 支持从设备端 `secrets.py` 读取凭据（凭据不进入仓库与 `.mpy`），`.gitignore` 已排除 `secrets.py`
 - **v1.1.1** ESP32 部署前提修复：
   - 校时：开机自动校时，**HTTP Date 优先**（认证前访问门户读 `Date` 头；实测 ESP32-C3 认证前 NTP UDP/123 会 `ETIMEDOUT`），NTP 兜底；对时失败明确报 `time-invalid` 而不是反复徒劳登录
   - 部署：新增 `tools/build_mpy.py`，ESP32-C3 等内存紧张设备用 `.mpy` 预编译部署，避免设备端编译造成 TLS 握手 `MBEDTLS_ERR_X509_ALLOC_FAILED`（实测 `.py` 失败、`.mpy` 正常）
