@@ -24,6 +24,7 @@
 | `neu_login_esp32.py` | ESP32 MicroPython 版：可独立运行，或作为库集成至业务代码 |
 | `test_neu_login.py` | 离线单元测试（不联网、不需要凭据） |
 | `test_p0_cpython.py` / `test_p0_esp32.py` | P0 安全/健壮性回归测试（离线，覆盖网络异常收敛、认证失败分级退避、SSO 白名单、TLS 证书校验与公钥刷新门禁） |
+| `test_esp32_time.py` | ESP32 时间同步与设备自检的离线测试（NTP 前置条件、时间异常拒绝登录、self_check 结构） |
 | `capture_connection.ps1` | Windows 连接过程日志采集脚本（用于连接过程分析与排障） |
 | `debian/` | Linux 主机一键部署（Debian 及兼容发行版；PC / 服务器 / 树莓派 / 开发板 / 随身 WiFi 设备），见 [`debian/部署指南.md`](debian/部署指南.md) |
 
@@ -52,6 +53,7 @@ python neu_login.py --kick 172.26.x.x
 python test_neu_login.py
 python test_p0_cpython.py
 python test_p0_esp32.py
+python test_esp32_time.py
 ```
 
 ## ESP32 版
@@ -63,8 +65,19 @@ python test_p0_esp32.py
 3. 上电自动连 WiFi 并登录；板载 LED 亮 = 在线，灭 = 掉线
 4. 同一文件也可直接在 PC 上调试：`python neu_login_esp32.py check`
 
-> **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**（需 NTP 或 `mpremote rtc --set`），时间错误会报证书校验失败。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
+> **TLS 证书校验（默认开启）**：ESP32 版内置 GlobalSign CA（`CA_CERT_PEM`），强制校验证书链与主机名（主机名由 `server_hostname` 校验）；校验失败直接报错，**绝不静默降级**。`CERT_REQUIRED` 要求**设备时间正确**：`run_forever()` 开机自动用 `NTP_HOST`（默认 `ntp.neu.edu.cn`，认证前可达）校时，失败会明确报 `time-invalid`；也可手动 `mpremote rtc --set`。仅当固件太旧不支持 `cadata`、且你明确接受中间人风险时，才可把 CONFIG 区 `ALLOW_INSECURE_TLS` 设为 `True`——此时会打印警告，并**禁用公钥在线刷新**（防止伪 AP 换钥窃取密码）。证书链轮换后用
 > `openssl s_client -showcerts -connect pass.neu.edu.cn:443` 更新 `CA_CERT_PEM`。
+
+**上机自检（真机必做一次）**：把文件以 `neulib.py` 上传（**不要命名 `main.py`**，否则上电直接进主循环），然后串口 REPL：
+
+```python
+import neulib as m
+m.wifi_connect()
+print(m.time_ok())        # 时间是否可用；False 时先 m.sync_time()
+print(m.self_check())     # TLS模式 / CA / 时间 / 主机名校验 / 剩余堆
+```
+
+`hostname_check` 必须是 `ok`；若返回 `FAIL: hostname-not-verified`，说明当前固件不校验主机名，请勿刷入在用设备（改用证书指纹锁定方案）。
 
 **方式 B：作为库集成到自己的业务代码**
 
@@ -145,6 +158,7 @@ GET  /cgi-bin/rad_user_info                   → 在线验证 + 真实联网探
 
 ## 版本
 
+- **v1.1.1** ESP32 部署前提修复：开机自动 NTP 校时（`CERT_REQUIRED` 依赖设备时钟，无 RTC 设备断电后必须校时），对时失败明确报 `time-invalid` 而不是反复徒劳登录；新增设备端 `self_check()`（TLS 模式/CA/时间/主机名校验/剩余堆）与离线测试 `test_esp32_time.py`
 - **v1.1** 安全与健壮性修复（P0）：
   - CPython：网络异常统一收敛，`--watch` 不再被一次网络抖动杀死；认证失败分级（auth/transient/config/limit）+ 指数退避 + 防锁号守卫 + 登录限流；SSO 跳转与 ticket 回跳强制白名单；证书错误不再自动降级，`--insecure` 显式关闭并禁用公钥刷新
   - ESP32：默认强制 TLS 证书链与主机名校验（内置 GlobalSign CA，`server_hostname` 校验主机名），校验失败不降级；`ALLOW_INSECURE_TLS=True` 时禁用公钥在线刷新；同步实现 SSO 跳转白名单；`ensure_online()` 永不抛异常

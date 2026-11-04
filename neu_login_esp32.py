@@ -58,6 +58,17 @@
 #     https://pass.neu.edu.cn, ticket 回跳必须是 ipgw.neu.edu.cn,
 #     否则视为中间人直接中止(不发送 RSA 密文)
 #
+# 时间要求 (CERT_REQUIRED 前提, 无 RTC 设备必读):
+#   ESP32 无电池 RTC, 断电后时钟复位为 2000 年 -> 证书校验因"尚未生效"直接失败。
+#   run_forever() 开机自动用 NTP_HOST(ntp.neu.edu.cn, 认证前可达) 校时;
+#   库模式请先调用 ensure_time()/sync_time(); 设备端自检 (REPL):
+#       import neulib as m
+#       m.wifi_connect()
+#       print(m.self_check())    # 检查: TLS模式/CA/时间/主机名校验/剩余堆
+#   self_check() 会对 pass.neu.edu.cn 做两次真实握手: 正确域名应成功、
+#   错误域名必须失败; 若返回 FAIL: hostname-not-verified 说明该固件
+#   未校验主机名, 请勿使用(或改用证书指纹锁定方案)。
+#
 # 合规: 仅供使用者本人账号的自动登录与个人学习研究使用,
 #       禁止用于对校园网的任何攻击或滥用 (详见仓库 README 免责声明)
 #
@@ -83,7 +94,7 @@ import ssl
 import binascii
 
 _IS_UPY = sys.implementation.name == "micropython"
-__version__ = "1.1"
+__version__ = "1.1.1"
 
 # ==================== CONFIG ====================
 WIFI_SSID = "NEU-2.4G"      # 开放网络, 无需密码
@@ -93,6 +104,9 @@ AC_ID = 16                 # 默认AC编号; 实际运行时从劫持URL自动�
 CHECK_INTERVAL = 30         # 在线巡检间隔(秒)
 LED_PIN = 2                 # 板载LED引脚, 不需要则设为 None
 DEBUG = False               # 置 True 打印各步骤服务器原始响应(仅排查用); 正常运行保持 False
+NTP_HOST = "ntp.neu.edu.cn" # 校时服务器(校内, 认证前可达); 无 RTC 设备上电后必须校时
+NTP_TIMEOUT = 8             # NTP 超时(秒)
+MIN_VALID_YEAR = 2024       # 设备时间早于该年份视为未对时(证书校验会失败)
 ALLOW_INSECURE_TLS = False  # !安全开关! 默认False=强制校验证书; 仅调试/旧固件应急才可
                             # 显式设为布尔 True: 不校验链路, 每次建连打印警告, 且
                             # 同时禁用公钥在线刷新 (详见文件头 TLS 章节)
@@ -1043,6 +1057,13 @@ def login(username, password):
         return False, "sso-reject:" + str(ex)
 
     n, e = get_key()
+    # 证书校验前提: 设备时间必须正确, 否则 CAS 的 TLS 握手必然失败
+    # (ESP32 无电池 RTC, 断电重启后需先 NTP 校时)
+    if _tls_mode() == "verified" and not time_ok():
+        tok, tmsg = ensure_time()
+        if not tok:
+            return False, ("time-invalid: 设备时间不可用于 TLS 证书校验, "
+                           "请先 NTP 校时或 mpremote rtc --set (%s)" % tmsg)
     ticket_url, err = cas_login(c, username, password, redirect, n, e)
     if err == "KEY_ROTATED":
         # 服务端解密失败 => 公钥可能已轮换; 仅校验证书链路允许在线刷新
@@ -1068,6 +1089,144 @@ def login(username, password):
             return True, "login-ok:" + info[0] + "@" + info[8]
         time.sleep(2)
     return False, "verify-fail"
+
+
+# ==================== 设备时间 (CERT_REQUIRED 前提) ====================
+# ESP32 无电池 RTC: 断电后时钟复位为 2000 年, 而 CERT_REQUIRED 会因
+# "证书尚未生效" 直接失败。因此开机必须先 NTP 校时, 否则自动登录不可用。
+
+def _time_year():
+    try:
+        return time.localtime()[0]
+    except Exception:
+        return 0
+
+
+def time_ok():
+    """设备时间是否可用于证书校验 (年份在合理区间)"""
+    y = _time_year()
+    return MIN_VALID_YEAR <= y <= 2099
+
+
+def sync_time(host=None, timeout=None):
+    """NTP 校时, 返回 (ok, msg)。依赖固件自带 ntptime 模块。
+
+    NTP_HOST 默认用校内服务器: 校园网认证前即可达, 不依赖外网。
+    """
+    host = host or NTP_HOST
+    timeout = timeout or NTP_TIMEOUT
+    try:
+        import ntptime
+    except ImportError:
+        return False, "no-ntptime (固件缺少 ntptime 模块)"
+    try:
+        try:
+            ntptime.host = host
+        except Exception:
+            pass
+        try:
+            ntptime.timeout = timeout
+        except Exception:
+            pass
+        ntptime.settime()
+    except Exception as ex:
+        return False, "ntp-fail(%s): %s" % (host, ex)
+    if not time_ok():
+        return False, "ntp-set-but-time-invalid(year=%d)" % _time_year()
+    return True, "ntp-ok(%s)" % host
+
+
+def ensure_time():
+    """确保设备时间可用于 TLS: 已正常则跳过, 否则 NTP 校时。返回 (ok, msg)"""
+    if time_ok():
+        return True, "time-ok"
+    ok, msg = sync_time()
+    if ok:
+        print("[time] NTP 校时成功: %s" % msg)
+    else:
+        print("[time] NTP 校时失败: %s (请检查 %s / 或 mpremote rtc --set)"
+              % (msg, NTP_HOST))
+    return ok, msg
+
+
+# ---------- 设备端自检 (REPL 调用) ----------
+
+def _dial_tcp(host, port=443, timeout=10):
+    addr = socket.getaddrinfo(host, port)[0][-1]
+    s = socket.socket()
+    s.settimeout(timeout)
+    s.connect(addr)
+    return s
+
+
+def _check_hostname_verification():
+    """真机自证主机名校验: 正确域名应握手成功, 错误域名必须失败
+
+    返回 'ok' / 'FAIL: hostname-not-verified' / 'tls-fail: ...' / 'skipped(insecure)'
+    """
+    if _tls_mode() == "INSECURE":
+        return "skipped(insecure)"
+    gc.collect()
+    s = None
+    try:
+        s = _dial_tcp(CAS_HOST)
+        t = _ssl_wrap_verified(s, CAS_HOST)
+        s = None
+        try:
+            t.close()
+        except Exception:
+            pass
+    except Exception as ex:
+        return "tls-fail: %s" % ex
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+    gc.collect()
+    s2 = None
+    try:
+        s2 = _dial_tcp(CAS_HOST)
+        _ssl_wrap_verified(s2, "wrong.invalid")
+        return "FAIL: hostname-not-verified"
+    except Exception:
+        return "ok"
+    finally:
+        if s2:
+            try:
+                s2.close()
+            except Exception:
+                pass
+
+
+def self_check():
+    """设备端自检: TLS 模式 / CA / 时间 / 主机名校验 / 剩余堆
+
+    用法 (设备 REPL, 模块上传为 neulib.py):
+        import neulib as m
+        m.wifi_connect()
+        print(m.self_check())          # 打印摘要并返回 dict
+    """
+    gc.collect()
+    mem = -1
+    try:
+        mem = gc.mem_free() // 1024
+    except AttributeError:
+        pass
+    out = {
+        "tls_mode": _tls_mode(),
+        "ca_subjects": _ca_subjects(),
+        "ca_loadable": _ca_loadable(),
+        "time": time.localtime()[:6],
+        "time_ok": time_ok(),
+        "hostname_check": _check_hostname_verification(),
+        "mem_free_kb": mem,
+    }
+    print("[self_check] tls=%s ca_loadable=%s time_ok=%s hostname=%s mem=%dkB"
+          % (out["tls_mode"], out["ca_loadable"], out["time_ok"],
+             out["hostname_check"], out["mem_free_kb"]))
+    return out
 
 
 # ==================== 业务集成 API ====================
@@ -1165,6 +1324,7 @@ def run_forever():
             continue
         gc.collect()
         print("[boot] v%s, heap free%s" % (__version__, _mems()))
+        ensure_time()          # 证书校验前提: 无 RTC 设备上电后必须 NTP 校时
         try:
             ok, msg = login(USERNAME, PASSWORD)
         except Exception as ex:
@@ -1217,6 +1377,7 @@ else:
             " / ".join(subs) if subs else "解析失败", len(subs), len(CA_CERT_PEM)))
         print("   CA加载: %s" % ("OK" if _ca_loadable() else "失败"))
         print("   校验内容: 证书链(内置 CA) + 主机名(server_hostname, 需设备时间正确)")
+        print("   设备时间: %s (time_ok=%s)" % (time.localtime()[:6], time_ok()))
         if ALLOW_INSECURE_TLS is True:
             print("   !!! 警告: ALLOW_INSECURE_TLS=True, 不校验证书且公钥在线刷新已禁用 !!!")
         c = HTTPClient()
