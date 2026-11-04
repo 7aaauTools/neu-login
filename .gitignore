@@ -8,3 +8,6 @@ credentials.json
 
 # 采集日志
 connection_log_*.txt
+
+# 运行时状态 (认证失败冷却标记)
+.authfail
